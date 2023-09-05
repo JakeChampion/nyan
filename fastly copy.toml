@@ -1,0 +1,34 @@
+# This file describes a Fastly Compute@Edge package. To learn more visit:
+# https://developer.fastly.com/reference/fastly-toml/
+
+authors = ["me@jakechampion.name"]
+description = "polyfill.io cdn implemented in javascript"
+language = "javascript"
+manifest_version = 2
+name = "polyfill-service.edgecompute.app"
+service_id = "3AfcolkTD4KUfkrKGIYZ4T"
+
+[scripts]
+  build = "npm run build"
+
+[local_server]
+
+# kv_stores."polyfill-library-3.111.0" = "./app/polyfill-libraries/polyfill-library-3.111.0/polyfills/__dist"
+# kv_stores."site" = "./dist"
+
+[local_server.config_stores]
+  [local_server.config_stores."config"]
+  format = "inline-toml"
+
+  [local_server.config_stores."config".contents]
+  "log" = "1"
+  "cache" = "yes"
+
+  # [local_server.config_stores."polyfill_library_3_111_0"]
+  # file = "./app/polyfill-libraries/polyfill-library-3.111.0.json"
+  # format = "json"
+
+  # [local_server.config_stores."polyfill_library_3_111_0_aliases"]
+  # file = "./app/polyfill-libraries/polyfill-library-3.111.0/polyfills/__dist/aliases.json"
+  # format = "json"
+

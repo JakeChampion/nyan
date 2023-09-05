@@ -1,6 +1,4 @@
-use topo_sort::{SortResults, TopoSort};
 use fastly::KVStore;
-// use topological_sort::TopologicalSort;
 use fastly::http::{header, Method, StatusCode};
 use fastly::Body;
 use fastly::ConfigStore;
@@ -12,6 +10,96 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::time::Duration;
+use fastly::cache::simple::{get_or_set_with, CacheEntry};
+
+fn toposort(nodes: Vec<String>, edges: Vec<(String, String)>) -> Result<Vec<String>, String> {
+    let mut cursor = nodes.len();
+    let mut sorted: Vec<String> = vec!["".to_string(); cursor];
+    let mut visited: HashMap<u32, bool> = HashMap::new();
+    let mut i = cursor as u32;
+    let outgoing_edges = make_outgoing_edges(&edges);
+    let nodes_hash = make_nodes_hash(&nodes);
+
+    for edge in &edges {
+        if !nodes_hash.contains_key(&edge.0) || !nodes_hash.contains_key(&edge.1) {
+            return Err("Unknown node. There is an unknown node in the supplied edges.".to_string());
+        }
+    }
+
+    while i > 0 {
+        i -= 1;
+        if !visited.contains_key(&i) {
+            visit(nodes.get(i as usize).unwrap().to_string(), i, &mut HashSet::new(), &mut visited, &outgoing_edges, &nodes_hash, &mut sorted, &mut cursor)?;
+        }
+    }
+
+    Ok(sorted)
+}
+
+fn visit(
+    node: String,
+    i: u32,
+    predecessors: &mut HashSet<String>,
+    visited: &mut HashMap<u32, bool>,
+    outgoing_edges: &HashMap<String, HashSet<String>>,
+    nodes_hash: &HashMap<String, usize>,
+    sorted: &mut Vec<String>,
+    cursor: &mut usize
+) -> Result<(), String> {
+    if predecessors.contains(&node) {
+        let node_rep = format!(", node was: {}", node);
+        return Err(format!("Cyclic dependency{}", node_rep));
+    }
+
+    if !nodes_hash.contains_key(&node) {
+        return Err(format!(
+            "Found unknown node. Make sure to provide all involved nodes. Unknown node: {}",
+            node
+        ));
+    }
+
+    if visited.contains_key(&i) {
+        return Ok(());
+    }
+    visited.insert(i, true);
+
+    let outgoing = outgoing_edges.get(&node).unwrap_or(&HashSet::new()).clone();
+    let outgoing: Vec<String> = outgoing.iter().cloned().collect();
+
+    let mut i = outgoing.len() as usize;
+    if i > 0 {
+        predecessors.insert(node.clone());
+        while i > 0 {
+            i -= 1;
+            let child = outgoing.get(i).unwrap();
+            visit(child.to_string(), *nodes_hash.get(child).unwrap() as u32, predecessors, visited, outgoing_edges, nodes_hash, sorted, cursor)?;
+        }
+        predecessors.remove(&node);
+    }
+
+    sorted[cursor.clone() - 1] = node;
+    *cursor -= 1;
+
+    Ok(())
+}
+
+fn make_outgoing_edges(arr: &Vec<(String, String)>) -> HashMap<String, HashSet<String>> {
+    let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
+    for edge in arr {
+        edges.entry(edge.0.clone()).or_insert_with(HashSet::new).insert(edge.1.clone());
+        edges.entry(edge.1.clone()).or_insert_with(HashSet::new);
+    }
+    edges
+}
+
+fn make_nodes_hash(arr: &Vec<String>) -> HashMap<String, usize> {
+    let mut res: HashMap<String, usize> = HashMap::new();
+    for (i, &ref node) in arr.iter().enumerate() {
+        res.insert(node.to_string(), i);
+    }
+    res
+}
 
 #[fastly::main]
 fn main(mut req: Request) -> Result<Response, Error> {
@@ -241,7 +329,14 @@ fn polyfill(request: &Request) -> Response {
         }
     };
     let version = parameters.version.clone();
-    let bundle = get_polyfill_string(parameters, library.to_owned(), version);
+    let bundle = get_or_set_with(request.get_url_str().to_owned(), || {
+        Ok(CacheEntry {
+            value: get_polyfill_string(parameters, library.to_owned(), version),
+            ttl: Duration::from_secs(60 * 1),
+        })
+    })
+    .unwrap()
+    .expect("closure always returns `Ok`, so we have a value");
     // return respondWithBundle(c, bundle);
     return Response::from_body(bundle);
 }
@@ -265,15 +360,14 @@ fn remove_feature(
 
 fn add_feature(
     feature_name: String,
-    _feature_flags: Option<Feature>,
-    _feature_properties: Option<Feature>,
+    feature: Feature,
     feature_names: &mut HashSet<String>,
     targeted_features: &mut HashMap<String, Feature>,
 ) -> bool {
     // targeted_features[feature_name] = Object.assign(Object.create(null), featureFlags, featureProperties);
     targeted_features.insert(
         feature_name.clone(),
-        Default::default(),
+        feature,
     );
     return feature_names.insert(feature_name);
 }
@@ -2620,7 +2714,6 @@ fn get_polyfills(
     let mut targeted_features: HashMap<String, Feature> = HashMap::new();
     loop {
         let mut bbreak = true;
-        println!("bbreak: {bbreak}");
         for feature_name in feature_names.clone() {
             // Remove feature if it exists in the `excludes` array.
             if options.excludes.contains(&feature_name) {
@@ -2630,7 +2723,6 @@ fn get_polyfills(
                     &mut targeted_features,
                 );
                 if removed {
-                    println!("excludes");
                     bbreak = false;
                 }
                 continue;
@@ -2665,13 +2757,11 @@ fn get_polyfills(
                 for aliased_feature in alias {
                     let added = add_feature(
                         aliased_feature,
-                        Some(properties.clone()),
-                        Some(alias_properties.clone()),
+                        alias_properties.clone(),
                         &mut feature_names,
                         &mut targeted_features,
                     );
                     if added {
-                        println!("alias");
                         bbreak = false;
                     }
                 }
@@ -2698,13 +2788,11 @@ fn get_polyfills(
                 // which I think is better than just pretending it doesn't exsist.
                 let added = add_feature(
                     feature_name.to_string(),
-                    None,
-                    None,
+                    Default::default(),
                     &mut feature_names,
                     &mut targeted_features,
                 );
                 if added {
-                    println!("unrecognized");
                     bbreak = false;
                 }
                 continue;
@@ -2719,13 +2807,11 @@ fn get_polyfills(
             if targeted {
                 let added = add_feature(
                     feature_name.to_string(),
-                    Some(properties.clone()),
-                    Some(properties.clone()),
+                    properties.clone(),
                     &mut feature_names,
                     &mut targeted_features,
                 );
                 if added {
-                    println!("targeted: {feature_name}");
                     bbreak = false;
                 }
                 let deps = meta.dependencies;
@@ -2743,13 +2829,11 @@ fn get_polyfills(
                     for dep in deps {
                         let added = add_feature(
                             dep,
-                            Some(properties.clone()),
-                            Some(dependency_properties.clone()),
+                            dependency_properties.clone(),
                             &mut feature_names,
                             &mut targeted_features,
                         );
                         if added {
-                            println!("dependency");
                             bbreak = false;
                         }
                     }
@@ -2761,7 +2845,6 @@ fn get_polyfills(
                     &mut targeted_features,
                 );
                 if removed {
-                    println!("not targeted");
                     bbreak = false;
                 }
             }
@@ -2782,10 +2865,7 @@ fn get_polyfill_string(options: PolyfillParameters, store: String, app_version: 
     let mut targeted_features = get_polyfills(options.clone(), store.clone(), "3.111.0".to_owned());
     let mut warnings: Vec<String> = vec![];
     let mut feature_nodes: Vec<String> = vec![];
-    let mut feature_edges: Vec<[String;2]> = vec![];
-
-    // let mut ts = TopologicalSort::<String>::new();
-    let mut topo_sort = TopoSort::new();
+    let mut feature_edges: Vec<(String, String)> = vec![];
 
     let t = targeted_features.clone();
     for (feature_name, feature) in targeted_features.iter_mut() {
@@ -2796,53 +2876,29 @@ fn get_polyfill_string(options: PolyfillParameters, store: String, app_version: 
                 if let Some(deps) = polyfill.dependencies {
                     for dep_name in deps {
                         if t.contains_key(&dep_name) {
-                            feature_edges.push([dep_name, feature_name.to_string()]);
+                            feature_edges.push((dep_name, feature_name.to_string()));
                         }
                     }
                 }
                 let license = polyfill.license.clone().unwrap_or_else(|| "CC0".to_owned());
-                println!("feature.dependency_of.is_empty(): {}", feature.dependency_of.is_empty());
-                println!("feature.alias_of.is_empty(): {}", feature.alias_of.is_empty());
-                let required_by = if !feature.dependency_of.is_empty() || !feature.alias_of.is_empty() {
-                    println!("meow: {feature_name}");
-                    panic!("moo");
-                    let dep: Vec<String> = feature.dependency_of.union(&feature.alias_of).into_iter().map(|f|f.to_owned()).collect();
-                    " (required by '".to_owned() + &dep.join("', '")
-                } else {
-                    "".to_owned()
-                };
-                feature.comment = Some(format!("{feature_name}, License: {license} {required_by}"));
-                // println!("{feature_name}: {:#?}", feature.comment);
+                // let required_by = if !feature.dependency_of.is_empty() || !feature.alias_of.is_empty() {
+                //     let dep: Vec<String> = feature.dependency_of.union(&feature.alias_of).into_iter().map(|f|f.to_owned()).collect();
+                //     " (required by \"".to_owned() + &dep.join("\", \"") + "\")"
+                // } else {
+                //     "".to_owned()
+                // };
+                // feature.comment = Some(format!("{feature_name}, License: {license} {required_by}"));
+                feature.comment = Some(format!("{feature_name}, License: {license}"));
             },
             None => warnings.push(feature_name.to_string()),
         }
     }
-    panic!("");
 
-    // feature_nodes.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
     feature_nodes.sort();
-    for feature_nodes in feature_nodes {
-        topo_sort.insert(feature_nodes.to_string(), vec![]);
-    }
-    feature_edges.sort_by_key(|f| f[1].to_string());
-    // println!("{:#?}", feature_edges);
-    // unimplemented!();
-    // feature_edges.sort_by(|a, b| a[1].to_lowercase().cmp(&b[1].to_lowercase()));
-    let mut f: HashMap<String, HashSet<String>> = HashMap::new();
-    for [dep_name, feature_name] in feature_edges {
-        if let Some(f) = f.get_mut(&feature_name) {
-            f.insert(dep_name.clone());
-        } else {
-            f.insert(feature_name, HashSet::from([dep_name]));
-        }
-    }
-    for g in f {
-        topo_sort.insert(g.0, g.1);
-    }
-    let sorted_features = match topo_sort.into_vec_nodes() {
-        SortResults::Full(nodes) => nodes,
-        SortResults::Partial(_) => panic!("unexpected cycle!"),
-    };
+    feature_edges.sort_by_key(|f| f.1.to_string());
+    // feature_nodes.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    // feature_edges.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    let sorted_features = toposort(feature_nodes, feature_edges).unwrap();
     if !options.minify {
     	explainer_comment.push(app_version_text);
         explainer_comment.push("For detailed credits and licence information see https://github.com/JakeChampion/polyfill-service.".to_owned());
@@ -2853,7 +2909,6 @@ fn get_polyfill_string(options: PolyfillParameters, store: String, app_version: 
         .iter()
         .for_each(|feature_name| {
             if let Some(feature) = targeted_features.get(feature_name) {
-                println!("{feature_name}: {:#?}", feature.comment);
                 explainer_comment.push(format!("- {}", feature.comment.as_ref().unwrap()));
             }
         });
