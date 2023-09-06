@@ -209,21 +209,20 @@ fn features_from_query_parameter(
     features_parameter: &str,
     flags_parameter: &str,
 ) -> HashMap<String, HashSet<String>> {
-    let features: Vec<String> = features_parameter
+    let features: Vec<&str> = features_parameter
         .split(',')
         .filter(|f| !f.is_empty())
-        .map(|f| f.to_owned())
         .collect();
-    let global_flags: Vec<String> = flags_parameter.split(',').map(|f| f.to_owned()).collect();
+    let global_flags: Vec<&str> = flags_parameter.split(',').collect();
     let mut features_with_flags: HashMap<String, HashSet<String>> = HashMap::new();
 
     for feature in features {
         // Eliminate XSS vuln
         let safe_feature = feature.replace("*/", "");
-        let mut things: Vec<String> = safe_feature.split('|').map(|f| f.to_owned()).collect();
+        let mut things: Vec<&str> = safe_feature.split('|').collect();
         let name = things.remove(0);
         things.append(&mut global_flags.clone());
-        let feature_specific_flags = things;
+        let feature_specific_flags = things.into_iter().map(|f| f.to_owned());
         features_with_flags.insert(
             name.replace('?', ""),
             HashSet::from_iter(feature_specific_flags),
@@ -2893,11 +2892,11 @@ fn get_polyfill_string(options: &PolyfillParameters, store: &str, app_version: &
                 explainer_comment.push(format!("- {}", feature.comment.as_ref().unwrap()));
             }
         });
-        // explainer_comment.push(
-        //     sorted_features
-        //     .iter()
-        //     .map(|comment| "- ".to_string() + &comment).collect::<Vec<String>>().join("\n")
-        // );
+        explainer_comment.push(
+            sorted_features
+            .iter()
+            .map(|comment| "- ".to_string() + &comment).collect::<Vec<String>>().join("\n")
+        );
         if !warnings.is_empty() {
             explainer_comment.push("".to_owned());
             explainer_comment.push("These features were not recognised:".to_owned());
