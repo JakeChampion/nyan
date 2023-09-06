@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::sync::OnceLock;
 use std::time::Duration;
 use fastly::cache::simple::{get_or_set_with, CacheEntry};
 
@@ -36,7 +37,7 @@ fn toposort(nodes: Vec<String>, edges: Vec<(String, String)>) -> Result<Vec<Stri
 
     Ok(sorted)
 }
-
+#[allow(clippy::too_many_arguments)]
 fn visit(
     node: String,
     i: u32,
@@ -67,7 +68,7 @@ fn visit(
     let outgoing = outgoing_edges.get(&node).unwrap_or(&HashSet::new()).clone();
     let outgoing: Vec<String> = outgoing.iter().cloned().collect();
 
-    let mut i = outgoing.len() as usize;
+    let mut i = outgoing.len();
     if i > 0 {
         predecessors.insert(node.clone());
         while i > 0 {
@@ -78,7 +79,7 @@ fn visit(
         predecessors.remove(&node);
     }
 
-    sorted[cursor.clone() - 1] = node;
+    sorted[*cursor - 1] = node;
     *cursor -= 1;
 
     Ok(())
@@ -93,9 +94,9 @@ fn make_outgoing_edges(arr: &Vec<(String, String)>) -> HashMap<String, HashSet<S
     edges
 }
 
-fn make_nodes_hash(arr: &Vec<String>) -> HashMap<String, usize> {
+fn make_nodes_hash(arr: &[String]) -> HashMap<String, usize> {
     let mut res: HashMap<String, usize> = HashMap::new();
-    for (i, &ref node) in arr.iter().enumerate() {
+    for (i, node) in arr.iter().enumerate() {
         res.insert(node.to_string(), i);
     }
     res
@@ -121,30 +122,19 @@ fn main(mut req: Request) -> Result<Response, Error> {
             .with_header(header::ALLOW, "GET, HEAD")
             .with_body_text_plain("This method is not allowed\n"));
     };
-    // app.use('*', logger());
-    // let isRunningLocally;
-    // app.use('*', (c, next) => {
-    //     let fastlyHostname = env("FASTLY_HOSTNAME");
-    //     isRunningLocally = fastlyHostname == "localhost";
-    //     return next();
-    // });
-
-    // app.get('/v3/', () => {
-    //     return new HTMLResponse(home())
-    // })
     match req.get_path() {
         "/" => {
-            return Ok(
+            Ok(
                 Response::from_status(StatusCode::PERMANENT_REDIRECT)
                 .with_header("Location", "/v3/")
                 .with_header("Cache-Control", "public, s-maxage=31536000, max-age=604800, stale-while-revalidate=604800, stale-if-error=604800, immutable")
             )
         },
         "/robots.txt" => {
-            return Ok(Response::from_body("User-agent: *\nDisallow:"))
+            Ok(Response::from_body("User-agent: *\nDisallow:"))
         },
         "/v1" => {
-            return Ok(
+            Ok(
                 Response::from_status(StatusCode::PERMANENT_REDIRECT)
                 .with_header("Location", "/v3/")
                 .with_header("Cache-Control", "public, s-maxage=31536000, max-age=604800, stale-while-revalidate=604800, stale-if-error=604800, immutable")
@@ -160,7 +150,6 @@ fn main(mut req: Request) -> Result<Response, Error> {
                     .with_header("Cache-Control", "public, s-maxage=31536000, max-age=604800, stale-while-revalidate=604800, stale-if-error=604800, immutable")
                 )
             }
-            // let requestURL = req.get_url_mut();
             if req.get_path() == "/v2/polyfill.js" || req.get_path() == "/v2/polyfill.min.js" {
                 req.set_path(&(String::from("/v3") + &req.get_path()[3..]));
 
@@ -172,25 +161,19 @@ fn main(mut req: Request) -> Result<Response, Error> {
                 req.set_query(&search_params).unwrap();
             }
 
-            if req.get_path().starts_with("/v2/") || req.get_path() == "/v2" {
-                if !(req.get_path().starts_with("/v2/polyfill.") && req.get_path().ends_with("js")) {
-                    return Ok(
-                        Response::from_status(StatusCode::PERMANENT_REDIRECT)
-                        .with_header("Location", "/v3/")
-                        .with_header("Cache-Control", "public, s-maxage=31536000, max-age=604800, stale-while-revalidate=604800, stale-if-error=604800, immutable")
-                    )
-                }
+            if (req.get_path().starts_with("/v2/") || req.get_path() == "/v2") && !(req.get_path().starts_with("/v2/polyfill.") && req.get_path().ends_with("js")) {
+                return Ok(
+                    Response::from_status(StatusCode::PERMANENT_REDIRECT)
+                    .with_header("Location", "/v3/")
+                    .with_header("Cache-Control", "public, s-maxage=31536000, max-age=604800, stale-while-revalidate=604800, stale-if-error=604800, immutable")
+                )
             }
 
             if req.get_path() == "/v3/polyfill.min.js" || req.get_path() == "/v3/polyfill.js" {
-                // requestURL.search = normalise_querystring_parameters_for_polyfill_bundle(
-                //     c.req,
-                //     requestURL.searchParams
-                // ).toString();
                 let backend_response = polyfill(&req);
-                return Ok(backend_response);
+                Ok(backend_response)
             } else {
-                return Ok(
+                Ok(
                     Response::from_status(StatusCode::NOT_FOUND)
                     .with_header("Cache-Control", "public, s-maxage=31536000, max-age=604800, stale-while-revalidate=604800, stale-if-error=604800, immutable")
                 )
@@ -200,26 +183,26 @@ fn main(mut req: Request) -> Result<Response, Error> {
 }
 
 fn features_from_query_parameter(
-    features_parameter: &String,
-    flags_parameter: &String,
+    features_parameter: &str,
+    flags_parameter: &str,
 ) -> HashMap<String, HashSet<String>> {
     let features: Vec<String> = features_parameter
-        .split(",")
-        .filter(|f| f.len() > 0)
+        .split(',')
+        .filter(|f| !f.is_empty())
         .map(|f| f.to_owned())
         .collect();
-    let global_flags: Vec<String> = flags_parameter.split(",").map(|f| f.to_owned()).collect();
+    let global_flags: Vec<String> = flags_parameter.split(',').map(|f| f.to_owned()).collect();
     let mut features_with_flags: HashMap<String, HashSet<String>> = HashMap::new();
 
     for feature in features {
         // Eliminate XSS vuln
         let safe_feature = feature.replace("*/", "");
-        let mut things: Vec<String> = safe_feature.split("|").map(|f| f.to_owned()).collect();
+        let mut things: Vec<String> = safe_feature.split('|').map(|f| f.to_owned()).collect();
         let name = things.remove(0);
         things.append(&mut global_flags.clone());
         let feature_specific_flags = things;
         features_with_flags.insert(
-            name.replace("?", ""),
+            name.replace('?', ""),
             HashSet::from_iter(feature_specific_flags),
         );
     }
@@ -229,7 +212,7 @@ fn features_from_query_parameter(
         features_with_flags.remove("all");
     }
 
-    return features_with_flags;
+    features_with_flags
 }
 
 #[derive(Clone, Default)]
@@ -277,7 +260,7 @@ fn get_polyfill_parameters(request: &Request) -> PolyfillParameters {
 
     return PolyfillParameters {
         excludes: if !excludes.is_empty() {
-            excludes.split(",").map(|e| e.to_owned()).collect()
+            excludes.split(',').map(|e| e.to_owned()).collect()
         } else {
             vec![]
         },
@@ -332,13 +315,13 @@ fn polyfill(request: &Request) -> Response {
     let bundle = get_or_set_with(request.get_url_str().to_owned(), || {
         Ok(CacheEntry {
             value: get_polyfill_string(parameters, library.to_owned(), version),
-            ttl: Duration::from_secs(60 * 1),
+            ttl: Duration::from_secs(600),
         })
     })
     .unwrap()
     .expect("closure always returns `Ok`, so we have a value");
     // return respondWithBundle(c, bundle);
-    return Response::from_body(bundle);
+    Response::from_body(bundle)
 }
 
 #[derive(Clone, Default)]
@@ -355,7 +338,7 @@ fn remove_feature(
     targeted_features: &mut HashMap<String, Feature>,
 ) -> bool {
     targeted_features.remove(&feature_name);
-    return feature_names.remove(&feature_name);
+    feature_names.remove(&feature_name)
 }
 
 fn add_feature(
@@ -369,7 +352,7 @@ fn add_feature(
         feature_name.clone(),
         feature,
     );
-    return feature_names.insert(feature_name);
+    feature_names.insert(feature_name)
 }
 
 #[allow(dead_code)]
@@ -391,58 +374,44 @@ struct Browsers {
     samsung_mob: Option<String>,
 }
 
-// #[derive(Clone, Deserialize)]
-// struct Install {
-//     module: String,
-//     paths: Option<Vec<String>>,
-// }
-
 #[derive(Clone, Deserialize)]
 struct PolyfillConfig {
     license: Option<String>,
-    // repo: Option<String>,
-    // install: Option<Install>,
-    // aliases: Vec<String>,
     dependencies: Option<Vec<String>>,
-    // spec: Option<String>,
-    // docs: Option<String>,
-    // notes: Option<Vec<String>>,
     browsers: HashMap<String, String>,
     detect_source: Option<String>,
-    // base_dir: Option<String>,
-    // has_tests: Option<bool>,
-    // is_testable: Option<bool>,
-    // is_public: Option<bool>,
-    // size: Option<usize>,
 }
 
+static POLYFILL_META_CONFIG_STORE: OnceLock<ConfigStore> = OnceLock::new();
 fn get_polyfill_meta(store: String, feature_name: String) -> Option<PolyfillConfig> {
     if feature_name.is_empty() {
         return None;
     }
-    let n = store.replace('-', "_").replace('.', "_");
-    let config = ConfigStore::open(&n);
+    let config = POLYFILL_META_CONFIG_STORE.get_or_init(|| {
+        let n = store.replace(['-', '.'], "_");
+        ConfigStore::open(&n)
+    });
     let meta = config.get(&feature_name);
-    return meta.map(|m| serde_json::from_str(&m).unwrap());
+    meta.map(|m| serde_json::from_str(&m).unwrap())
 }
 
+static POLYFILL_ALIASES_CONFIG_STORE: OnceLock<ConfigStore> = OnceLock::new();
 fn get_config_aliases(store: String, alias: String) -> Option<Vec<String>> {
     if alias.is_empty() {
         return None;
     }
-    let n = store.replace('-', "_").replace('.', "_");
-    let aliases = ConfigStore::open(&(n + "_aliases"));
-    return aliases
+    let aliases = POLYFILL_ALIASES_CONFIG_STORE.get_or_init(||{
+        let n = store.replace(['-', '.'], "_");
+        ConfigStore::open(&(n + "_aliases"))
+    });
+    aliases
         .get(&alias)
-        .map(|m| serde_json::from_str(&m).unwrap());
+        .map(|m| serde_json::from_str(&m).unwrap())
 }
 
 struct UA {
     version: String,
     family: String,
-    // major: String,
-    // minor: String,
-    // patch: String,
 }
 
 impl UA {
@@ -455,19 +424,18 @@ impl UA {
         if let Some(normalized) = re.captures(&ua_string) {
             family = normalized
                 .get(1)
-                .map(|f| Into::<&str>::into(f))
+                .map(Into::<&str>::into)
                 .unwrap()
                 .into();
             major = normalized
                 .get(2)
-                .map(|f| Into::<&str>::into(f))
+                .map(Into::<&str>::into)
                 .unwrap()
                 .into();
             minor = normalized
                 .get(3)
-                .map(|f| Into::<&str>::into(f))
-                .or_else(|| Some("0"))
-                .unwrap()
+                .map(Into::<&str>::into)
+                .unwrap_or("0")
                 .to_owned();
         } else {
             // Google Search iOS app should be detected as the underlying browser, which is safari on iOS
@@ -907,12 +875,10 @@ impl UA {
                 minor = "0".to_owned();
             }
         }
-        if family == "googlebot" {
-            if family == "googlebot" && major == "2" && minor == "1" {
-                family = "chrome".to_owned();
-                major = "41".to_owned();
-                minor = "0".to_owned();
-            }
+        if family == "googlebot" && major == "2" && minor == "1" {
+            family = "chrome".to_owned();
+            major = "41".to_owned();
+            minor = "0".to_owned();
         }
         if family == "edge"
             || family == "edge_mob"
@@ -941,47 +907,34 @@ impl UA {
 
         let version = format!("{major}.{minor}.0");
 
-        return UA {
+        UA {
             version,
             family: family.to_owned(),
             // major: major.to_owned(),
             // minor: minor.to_owned(),
             // patch: patch.to_owned(),
-        };
+        }
     }
 
     fn get_family(&self) -> String {
-        return self.family.clone();
+        self.family.clone()
     }
-
-    // fn get_version(&self) -> String {
-    //     return self.version.clone();
-    // }
 
     fn satisfies(&self, range: String) -> bool {
         let req = VersionReq::parse(&range).unwrap();
         let version = Version::parse(&self.version).unwrap();
-        return req.matches(&version);
+        req.matches(&version)
     }
-
-    // fn get_baseline(&self) -> String {
-    //     return UA::get_baselines().get(&self.family).unwrap().to_string();
-    // }
 
     fn meets_baseline(&self) -> bool {
         let family = &self.family;
         let range = format!(">={}", UA::get_baselines().get(family).unwrap());
-        return self.satisfies(range);
+        self.satisfies(range)
     }
 
     fn is_unknown(&self) -> bool {
-        return !UA::get_baselines().contains_key(&self.family) || !self.meets_baseline();
+        !UA::get_baselines().contains_key(&self.family) || !self.meets_baseline()
     }
-
-    // fn normalize(ua_string: String) -> String {
-    //     let ua = UA::new(ua_string);
-    //     return format!("{}/{}", ua.family, ua.version);
-    // }
 
     fn get_baselines() -> HashMap<String, String> {
         let mut b: HashMap<String, String> = HashMap::new();
@@ -1001,7 +954,7 @@ impl UA {
         b.insert("op_mini".to_owned(), "5".to_owned());
         b.insert("bb".to_owned(), "6".to_owned());
         b.insert("samsung_mob".to_owned(), "4".to_owned());
-        return b;
+        b
     }
 }
 
@@ -2693,7 +2646,7 @@ fn useragent(ua: String) -> [String; 4] {
         return [ family, major, minor, patch ];
       }
 
-    return [family, major, minor, patch];
+    [family, major, minor, patch]
 }
 
 fn get_polyfills(
@@ -2739,7 +2692,7 @@ fn get_polyfills(
                         .features
                         .get(&feature_name)
                         .map(|f| f.to_owned())
-                        .unwrap_or_else(|| HashSet::new()),
+                        .unwrap_or_else(HashSet::new),
                 },
             };
 
@@ -2749,9 +2702,9 @@ fn get_polyfills(
             if let Some(alias) = alias {
                 let mut alias_properties = Feature {
                     comment: None,
-                    alias_of: HashSet::from(properties.clone().alias_of),
-                    dependency_of: HashSet::from(properties.clone().dependency_of),
-                    flags: HashSet::from(properties.clone().flags),
+                    alias_of: properties.clone().alias_of,
+                    dependency_of: properties.clone().dependency_of,
+                    flags: properties.clone().flags,
                 };
                 alias_properties.alias_of.insert(feature_name.to_string());
                 for aliased_feature in alias {
@@ -2819,9 +2772,9 @@ fn get_polyfills(
                 if let Some(deps) = deps {
                     let mut dependency_properties = Feature {
                         comment: None,
-                        alias_of: HashSet::from(properties.clone().alias_of),
-                        dependency_of: HashSet::from(properties.clone().dependency_of),
-                        flags: HashSet::from(properties.clone().flags.clone()),
+                        alias_of: properties.clone().alias_of,
+                        dependency_of: properties.clone().dependency_of,
+                        flags: properties.clone().flags.clone(),
                     };
                     dependency_properties
                         .dependency_of
@@ -2853,7 +2806,7 @@ fn get_polyfills(
             break;
         }
     }
-    return targeted_features;
+    targeted_features
 }
 
 fn get_polyfill_string(options: PolyfillParameters, store: String, app_version: String) -> Body {
@@ -2964,11 +2917,9 @@ fn get_polyfill_string(options: PolyfillParameters, store: String, app_version: 
         output.write_str(lf);
         output.write_str("('object' == typeof window && window || 'object' == typeof self && self || 'object' == typeof global && global || {});");
         output.write_str(lf);
-    } else {
-    	if !options.minify {
+    } else if !options.minify {
     		output.write_str("\n/* No polyfills needed for current settings and browser */\n\n");
     	}
-    }
     if let Some(callback) = options.callback {
     	output.write_str("\ntypeof ");
         output.write_str(&callback);
@@ -2976,23 +2927,27 @@ fn get_polyfill_string(options: PolyfillParameters, store: String, app_version: 
         output.write_str(&callback);
         output.write_str("();");
     }
-    return output;
+    output
 
 }
 
+static POLYFILL_SOURCE_CONFIG_STORE: OnceLock<ConfigStore> = OnceLock::new();
+static POLYFILL_SOURCE_KV_STORE: OnceLock<KVStore> = OnceLock::new();
 fn polyfill_source(store: String, feature_name: String, format: String) -> Body {
-    let n = store.replace('-', "_").replace('.', "_");
-    let config = ConfigStore::open(&n);
-	let c = config.get(&format!("{feature_name}/{format}.js"));
+    let c = POLYFILL_SOURCE_CONFIG_STORE.get_or_init(||{
+        let n = store.replace(['-', '.'], "_");
+        ConfigStore::open(&n)
+    });
+	let c = c.get(&format!("{feature_name}/{format}.js"));
 	if let Some(c) = c {
 		return Body::from(c);
 	}
-    let polyfills = KVStore::open(&store).unwrap().unwrap();
+    let polyfills = POLYFILL_SOURCE_KV_STORE.get_or_init(||KVStore::open(&store).unwrap().unwrap());
     let polyfill = polyfills.lookup(&format!("/{feature_name}/{format}.js")).unwrap();
     if polyfill.is_none() {
         let format = if format == "raw" { "min" } else { "raw" };
         let polyfill = polyfills.lookup(&format!("/{feature_name}/{format}.js")).unwrap();
         return polyfill.unwrap();
     }
-	return polyfill.unwrap();
+	polyfill.unwrap()
 }
