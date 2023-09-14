@@ -1,3 +1,6 @@
+mod toposort;
+use toposort::toposort;
+
 use fastly::cache::simple::{get_or_set_with, CacheEntry};
 use fastly::http::{header, Method, StatusCode};
 use fastly::Body;
@@ -13,117 +16,6 @@ use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::sync::OnceLock;
 use std::time::Duration;
-
-fn toposort(nodes: Vec<String>, edges: Vec<(String, String)>) -> Result<Vec<String>, String> {
-    let mut cursor = nodes.len();
-    let mut sorted: Vec<String> = vec!["".to_string(); cursor];
-    let mut visited: HashMap<u32, bool> = HashMap::new();
-    let mut i = cursor as u32;
-    let outgoing_edges = make_outgoing_edges(&edges);
-    let nodes_hash = make_nodes_hash(&nodes);
-
-    for edge in &edges {
-        if !nodes_hash.contains_key(&edge.0) || !nodes_hash.contains_key(&edge.1) {
-            return Err(
-                "Unknown node. There is an unknown node in the supplied edges.".to_string(),
-            );
-        }
-    }
-
-    while i > 0 {
-        i -= 1;
-        if !visited.contains_key(&i) {
-            visit(
-                nodes.get(i as usize).unwrap().to_string(),
-                i,
-                &mut HashSet::new(),
-                &mut visited,
-                &outgoing_edges,
-                &nodes_hash,
-                &mut sorted,
-                &mut cursor,
-            )?;
-        }
-    }
-
-    Ok(sorted)
-}
-#[allow(clippy::too_many_arguments)]
-fn visit(
-    node: String,
-    i: u32,
-    predecessors: &mut HashSet<String>,
-    visited: &mut HashMap<u32, bool>,
-    outgoing_edges: &HashMap<String, HashSet<String>>,
-    nodes_hash: &HashMap<String, usize>,
-    sorted: &mut Vec<String>,
-    cursor: &mut usize,
-) -> Result<(), String> {
-    if predecessors.contains(&node) {
-        let node_rep = format!(", node was: {}", node);
-        return Err(format!("Cyclic dependency{}", node_rep));
-    }
-
-    if !nodes_hash.contains_key(&node) {
-        return Err(format!(
-            "Found unknown node. Make sure to provide all involved nodes. Unknown node: {}",
-            node
-        ));
-    }
-
-    if visited.contains_key(&i) {
-        return Ok(());
-    }
-    visited.insert(i, true);
-
-    let outgoing = outgoing_edges.get(&node).unwrap_or(&HashSet::new()).clone();
-    let outgoing: Vec<String> = outgoing.iter().cloned().collect();
-
-    let mut i = outgoing.len();
-    if i > 0 {
-        predecessors.insert(node.clone());
-        while i > 0 {
-            i -= 1;
-            let child = outgoing.get(i).unwrap();
-            visit(
-                child.to_string(),
-                *nodes_hash.get(child).unwrap() as u32,
-                predecessors,
-                visited,
-                outgoing_edges,
-                nodes_hash,
-                sorted,
-                cursor,
-            )?;
-        }
-        predecessors.remove(&node);
-    }
-
-    sorted[*cursor - 1] = node;
-    *cursor -= 1;
-
-    Ok(())
-}
-
-fn make_outgoing_edges(arr: &Vec<(String, String)>) -> HashMap<String, HashSet<String>> {
-    let mut edges: HashMap<String, HashSet<String>> = HashMap::new();
-    for edge in arr {
-        edges
-            .entry(edge.0.clone())
-            .or_insert_with(HashSet::new)
-            .insert(edge.1.clone());
-        edges.entry(edge.1.clone()).or_insert_with(HashSet::new);
-    }
-    edges
-}
-
-fn make_nodes_hash(arr: &[String]) -> HashMap<String, usize> {
-    let mut res: HashMap<String, usize> = HashMap::new();
-    for (i, node) in arr.iter().enumerate() {
-        res.insert(node.to_string(), i);
-    }
-    res
-}
 
 #[fastly::main]
 fn main(mut req: Request) -> Result<Response, Error> {
@@ -336,24 +228,21 @@ fn polyfill(request: &Request) -> Response {
     let version = parameters.version.clone();
     let is_running_locally =
         std::env::var("FASTLY_HOSTNAME").unwrap_or_else(|_| String::new()) == "localhost";
-    if !is_running_locally {
-        let bundle = get_or_set_with(request.get_url_str().to_owned(), || {
+    let bundle = if !is_running_locally {
+        get_or_set_with(request.get_url_str().to_owned(), || {
             Ok(CacheEntry {
                 value: get_polyfill_string(&parameters, library, &version),
                 ttl: Duration::from_secs(600),
             })
         })
         .unwrap()
-        .expect("closure always returns `Ok`, so we have a value");
-        // return respondWithBundle(c, bundle);
-        Response::from_body(bundle)
-        .with_header("x-compress-hint", "on")
-        .with_header("Content-Type", "text/javascript; charset=UTF-8")
+        .expect("closure always returns `Ok`, so we have a value")
     } else {
-        Response::from_body(get_polyfill_string(&parameters, library, &version))
+        get_polyfill_string(&parameters, library, &version)
+    };
+    Response::from_body(bundle)
         .with_header("x-compress-hint", "on")
         .with_header("Content-Type", "text/javascript; charset=UTF-8")
-    }
 }
 
 #[derive(Clone, Default)]
@@ -2775,7 +2664,7 @@ fn get_polyfills(
             // If not already targeted, check to see if the polyfill's configuration states it should target
             // this browser version.
             if !targeted {
-                targeted = ua.satisfies(meta.browsers.get(&family).unwrap().clone());
+                targeted = ua.satisfies(meta.browsers.get(&family).unwrap().to_string());
             }
 
             if targeted {
@@ -2855,12 +2744,18 @@ fn get_polyfill_string(options: &PolyfillParameters, store: &str, app_version: &
                     }
                 }
                 let license = polyfill.license.unwrap_or_else(|| "CC0".to_owned());
-                let required_by = if !feature.dependency_of.is_empty() || !feature.alias_of.is_empty() {
-                    let dep: Vec<String> = feature.dependency_of.union(&feature.alias_of).into_iter().map(|f|f.to_owned()).collect();
-                    " (required by \"".to_owned() + &dep.join("\", \"") + "\")"
-                } else {
-                    "".to_owned()
-                };
+                let required_by =
+                    if !feature.dependency_of.is_empty() || !feature.alias_of.is_empty() {
+                        let dep: Vec<String> = feature
+                            .dependency_of
+                            .union(&feature.alias_of)
+                            .into_iter()
+                            .map(|f| f.to_owned())
+                            .collect();
+                        " (required by \"".to_owned() + &dep.join("\", \"") + "\")"
+                    } else {
+                        "".to_owned()
+                    };
                 feature.comment = Some(format!("{feature_name}, License: {license} {required_by}"));
                 // feature.comment = Some(format!("{feature_name}, License: {license}"));
             }
@@ -2870,9 +2765,10 @@ fn get_polyfill_string(options: &PolyfillParameters, store: &str, app_version: &
 
     feature_nodes.sort();
     feature_edges.sort_by_key(|f| f.1.to_string());
+
     // feature_nodes.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
     // feature_edges.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-    let sorted_features = toposort(feature_nodes, feature_edges).unwrap();
+    let sorted_features = toposort(&feature_nodes, &feature_edges).unwrap();
     if !options.minify {
         explainer_comment.push(app_version_text);
         explainer_comment.push("For detailed credits and licence information see https://github.com/JakeChampion/polyfill-service.".to_owned());
@@ -2894,8 +2790,10 @@ fn get_polyfill_string(options: &PolyfillParameters, store: &str, app_version: &
         });
         explainer_comment.push(
             sorted_features
-            .iter()
-            .map(|comment| "- ".to_string() + &comment).collect::<Vec<String>>().join("\n")
+                .iter()
+                .map(|comment| "- ".to_string() + &comment)
+                .collect::<Vec<String>>()
+                .join("\n"),
         );
         if !warnings.is_empty() {
             explainer_comment.push("".to_owned());
