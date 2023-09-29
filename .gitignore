@@ -3,3 +3,5 @@ bin
 .cargo
 pkg
 polyfill-libraries
+node_modules
+dist

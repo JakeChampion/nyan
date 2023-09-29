@@ -1,10 +1,15 @@
 mod features_from_query_parameter;
+mod get;
 mod get_polyfill_string;
+mod old_ua;
+mod parse;
 mod polyfill_parameters;
 mod toposort;
+mod ua;
 mod useragent;
 
 use crate::features_from_query_parameter::features_from_query_parameter;
+use crate::get::get;
 use crate::get_polyfill_string::get_polyfill_string;
 use fastly::cache::simple::{get_or_set_with, CacheEntry};
 use fastly::http::{header, Method, StatusCode};
@@ -12,18 +17,35 @@ use fastly::{Error, Request, Response};
 use polyfill_parameters::PolyfillParameters;
 use regex::Regex;
 use std::collections::HashMap;
+use urlencoding::decode;
 
 use std::time::Duration;
 
 #[fastly::main]
 fn main(mut req: Request) -> Result<Response, Error> {
+    // fastly::log::set_panic_endpoint("slack").unwrap();
+    // let endpoint = Endpoint::from_name("slack");
     // Log service version
     println!(
         "FASTLY_SERVICE_VERSION: {}",
         std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new())
     );
+    let url = req.get_url_str().to_string();
+    println!("url: {}", url);
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!(
+            "FASTLY_SERVICE_VERSION: {}\nurl: {}\n{}",
+            std::env::var("FASTLY_SERVICE_VERSION").unwrap_or_else(|_| String::new()),
+            url.clone(),
+            info.to_string()
+        );
+    }));
 
     let method = req.get_method();
+    let path = req.get_path();
+    if method == Method::POST && path == "/__panic" {
+        panic!("{}", req.into_body_str_lossy());
+    }
     if method == Method::OPTIONS {
         return Ok(
             Response::from_status(StatusCode::OK)
@@ -35,7 +57,7 @@ fn main(mut req: Request) -> Result<Response, Error> {
             .with_header(header::ALLOW, "GET, HEAD")
             .with_body_text_plain("This method is not allowed\n"));
     };
-    match req.get_path() {
+    match path {
         "/" => {
             Ok(
                 Response::from_status(StatusCode::PERMANENT_REDIRECT)
@@ -84,10 +106,11 @@ fn main(mut req: Request) -> Result<Response, Error> {
             if req.get_path() == "/v3/polyfill.min.js" || req.get_path() == "/v3/polyfill.js" {
                 Ok(polyfill(&req))
             } else {
-                Ok(
-                    Response::from_status(StatusCode::NOT_FOUND)
+                let res = get("site", req)?;
+                Ok(res.unwrap_or_else(|| {
+                    Response::from_status(StatusCode::NOT_FOUND).with_body("Not Found")
                     .with_header("Cache-Control", "public, s-maxage=31536000, max-age=604800, stale-while-revalidate=604800, stale-if-error=604800, immutable")
-                )
+                }))
             }
         }
     }
@@ -98,11 +121,19 @@ fn get_polyfill_parameters(request: &Request) -> PolyfillParameters {
     let path = request.get_path();
     let excludes = query
         .get("excludes")
-        .map(|f| f.to_owned())
+        .map(|f| {
+            decode(f)
+                .map(|f| f.to_string())
+                .unwrap_or_else(|_| f.to_string())
+        })
         .unwrap_or_else(|| "".to_owned());
     let features = query
         .get("features")
-        .map(|f| f.to_owned())
+        .map(|f| {
+            decode(f)
+                .map(|f| f.to_string())
+                .unwrap_or_else(|_| f.to_string())
+        })
         .unwrap_or_else(|| "default".to_owned());
     let unknown = query
         .get("unknown")
@@ -111,10 +142,18 @@ fn get_polyfill_parameters(request: &Request) -> PolyfillParameters {
     let version = query
         .get("version")
         .map(|f| f.to_owned())
+        .map(|f| {
+            if f.is_empty() {
+                "3.111.0".to_owned()
+            } else {
+                f
+            }
+        })
         .unwrap_or_else(|| "3.111.0".to_owned());
-    let callback = query.get("callback").filter(|callback| {
-        Regex::new(r"^[\w.]+$").unwrap().is_match(callback)
-    }).map(|callback| callback.to_owned());
+    let callback = query
+        .get("callback")
+        .filter(|callback| Regex::new(r"^[\w.]+$").unwrap().is_match(callback))
+        .map(|callback| callback.to_owned());
     let ua_string = query.get("ua").map(|f| f.to_owned()).unwrap_or_else(|| {
         request
             .get_header_str("user-agent")
@@ -126,7 +165,7 @@ fn get_polyfill_parameters(request: &Request) -> PolyfillParameters {
         .map(|f| f.to_owned())
         .unwrap_or_else(|| "".to_owned());
 
-    // let strict = query.contains_key("strict");
+    let strict = query.contains_key("strict");
 
     return PolyfillParameters {
         excludes: if !excludes.is_empty() {
@@ -140,7 +179,7 @@ fn get_polyfill_parameters(request: &Request) -> PolyfillParameters {
         unknown,
         ua_string,
         version,
-        // strict,
+        strict,
     };
 }
 

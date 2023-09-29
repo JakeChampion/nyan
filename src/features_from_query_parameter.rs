@@ -5,10 +5,11 @@ pub(crate) fn features_from_query_parameter(
     features_parameter: &str,
     flags_parameter: &str,
 ) -> HashMap<String, HashSet<String>> {
-    let features: Vec<&str> = features_parameter
+    let mut features: Vec<&str> = features_parameter
         .split(',')
         .filter(|f| !f.is_empty())
         .collect();
+    features.sort();
     let global_flags: Vec<&str> = flags_parameter.split(',').collect();
     let mut features_with_flags: HashMap<String, HashSet<String>> = HashMap::new();
 

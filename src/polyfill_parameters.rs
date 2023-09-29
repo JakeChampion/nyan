@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub(crate) struct PolyfillParameters {
     pub excludes: Vec<String>,
@@ -9,4 +10,5 @@ pub(crate) struct PolyfillParameters {
     pub unknown: String,
     pub ua_string: String,
     pub version: String,
+    pub strict: bool,
 }

@@ -1,11 +1,17 @@
-use crate::useragent::useragent;
+use crate::{
+    old_ua::{self, OldUA},
+    ua::UserAgent,
+    useragent::useragent,
+};
+use chrono::Utc;
 use fastly::{Body, ConfigStore, KVStore};
+use indexmap::IndexSet;
+use nodejs_semver::{Range, Version};
 use regex::Regex;
-use semver::{Version, VersionReq};
+// use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
-    iter::FromIterator,
     sync::OnceLock,
 };
 
@@ -30,19 +36,21 @@ struct Browsers {
     samsung_mob: Option<String>,
 }
 
+#[derive(Clone, Default, Debug)]
 struct UA {
     version: String,
     family: String,
 }
 
-impl UA {
-    fn new(ua_string: &str) -> UA {
+impl UserAgent for UA {
+    fn new(ua_string: &str) -> Self {
+        // println!("ua_string: {}", ua_string);
         let mut family: String;
         let mut major: String;
         let mut minor: String;
-        // let mut patch: String = "0".to_owned();
-        let re: Regex = Regex::new(r"(?i)^(\w+)\/(\d+)(?:\.(\d+){2})?$").unwrap();
+        let re: Regex = Regex::new(r"(?i)^(\w+)/(\d+)\.?(\d+)?\.?(\d+)?$").unwrap();
         if let Some(normalized) = re.captures(&ua_string) {
+            // println!("normalized: {:#?}", normalized);
             family = normalized.get(1).map(Into::<&str>::into).unwrap().into();
             major = normalized.get(2).map(Into::<&str>::into).unwrap().into();
             minor = normalized
@@ -132,7 +140,8 @@ impl UA {
                     .replace(&ua_string, "");
 
             let ua = useragent(&ua_string);
-            family = ua[0].clone();
+            // println!("ua: {:#?}", ua);
+            family = ua[0].clone().to_lowercase();
             major = ua[1].clone();
             minor = ua[2].clone();
         }
@@ -514,17 +523,14 @@ impl UA {
             family = "other".to_owned();
             major = "0".to_owned();
             minor = "0".to_owned();
-            // patch = "0".to_owned();
         }
 
         let version = format!("{major}.{minor}.0");
 
+        // println!("ua norm: {}/{}", family, version);
         UA {
             version,
             family: family.to_owned(),
-            // major: major.to_owned(),
-            // minor: minor.to_owned(),
-            // patch: patch.to_owned(),
         }
     }
 
@@ -533,15 +539,25 @@ impl UA {
     }
 
     fn satisfies(&self, range: String) -> bool {
-        let req = VersionReq::parse(&range).unwrap();
-        let version = Version::parse(&self.version).unwrap();
-        req.matches(&version)
+        let req: Range = range.parse().expect(&format!("err: {}", range));
+        let version: Version = self
+            .version
+            .parse()
+            .expect(&format!("err: {}", self.version));
+        // println!("req: {:#?}", req);
+        // println!("version: {:#?}", version);
+        version.satisfies(&req)
     }
 
     fn meets_baseline(&self) -> bool {
         let family = &self.family;
-        let range = format!(">={}", UA::get_baselines().get(family).unwrap());
-        self.satisfies(range)
+        match UA::get_baselines().get(family) {
+            Some(family) => {
+                let range = format!(">={}", family);
+                self.satisfies(range)
+            }
+            None => false,
+        }
     }
 
     fn is_unknown(&self) -> bool {
@@ -571,10 +587,11 @@ impl UA {
 }
 
 #[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PolyfillConfig {
     license: Option<String>,
     dependencies: Option<Vec<String>>,
-    browsers: HashMap<String, String>,
+    browsers: Option<HashMap<String, String>>,
     detect_source: Option<String>,
 }
 
@@ -588,7 +605,13 @@ fn get_polyfill_meta(store: &str, feature_name: &str) -> Option<PolyfillConfig> 
         ConfigStore::open(&n)
     });
     let meta = config.get(&feature_name);
+    // println!("feature_name: {feature_name}");
+    // println!("meta: {:#?}", meta);
     meta.map(|m| serde_json::from_str(&m).unwrap())
+    // match meta {
+    //     Some(m) => serde_json::from_str(&m).unwrap_or_else(|_| None),
+    //     None => None,
+    // }
 }
 
 static POLYFILL_ALIASES_CONFIG_STORE: OnceLock<ConfigStore> = OnceLock::new();
@@ -605,184 +628,245 @@ fn get_config_aliases(store: &str, alias: &str) -> Option<Vec<String>> {
         .map(|m| serde_json::from_str(&m).unwrap())
 }
 
-#[derive(Clone, Default)]
-struct Feature {
-    alias_of: HashSet<String>,
+#[derive(Clone, Default, Debug)]
+struct FeatureProperties {
     flags: HashSet<String>,
     comment: Option<String>,
 }
 
+#[derive(Debug)]
+enum U {
+    Old(OldUA),
+    Current(UA),
+}
+
+impl U {
+    fn is_unknown(&self) -> bool {
+        match self {
+            U::Old(u) => u.is_unknown(),
+            U::Current(u) => u.is_unknown(),
+        }
+    }
+
+    fn get_family(&self) -> String {
+        match self {
+            U::Old(u) => u.get_family(),
+            U::Current(u) => u.get_family(),
+        }
+    }
+    fn satisfies(&self, range: String) -> bool {
+        match self {
+            U::Old(u) => u.satisfies(range),
+            U::Current(u) => u.satisfies(range),
+        }
+    }
+}
+
 fn remove_feature(
-    feature_name: String,
-    feature_names: &mut HashSet<String>,
-    targeted_features: &mut HashMap<String, Feature>,
+    feature_name: &str,
+    feature_names: &mut IndexSet<String>,
+    targeted_features: &mut HashMap<String, FeatureProperties>,
 ) -> bool {
-    targeted_features.remove(&feature_name);
-    feature_names.remove(&feature_name)
+    feature_names.remove(feature_name);
+    return targeted_features.remove(feature_name).is_some();
 }
 
 fn add_feature(
-    feature_name: String,
-    feature: Feature,
-    feature_names: &mut HashSet<String>,
-    targeted_features: &mut HashMap<String, Feature>,
+    feature_name: &str,
+    feature_flags: HashSet<String>,
+    feature_properties: FeatureProperties,
+    // comment: Option<String>,
+    feature_names: &mut IndexSet<String>,
+    targeted_features: &mut HashMap<String, FeatureProperties>,
 ) -> bool {
-    // targeted_features[feature_name] = Object.assign(Object.create(null), featureFlags, featureProperties);
-    targeted_features.insert(feature_name.clone(), feature);
-    feature_names.insert(feature_name)
+    let mut properties = feature_properties;
+    properties.flags.extend(feature_flags);
+    // println!("comment: {:#?}", comment);
+    // properties.comment = match (comment.clone(), properties.comment) {
+    //     (None, None) => None,
+    //     (None, Some(comment)) => Some(comment),
+    //     (Some(comment), None) => Some(comment),
+    //     (Some(c1), Some(c2)) => Some(c1+&c2),
+    // };
+    feature_names.insert(feature_name.to_string());
+    if let Some(f) = targeted_features.get(&feature_name.to_string()) {
+        let mut f = f.clone();
+        f.flags.extend(properties.flags);
+
+        // f.comment = match (f.comment, properties.comment) {
+        //     (None, None) => comment,
+        //     (None, Some(comment)) => Some(comment),
+        //     (Some(comment), None) => Some(comment),
+        //     (Some(c1), Some(c2)) => Some(c1+&c2),
+        // };
+        return targeted_features
+            .insert(feature_name.to_string(), f)
+            .is_none();
+    }
+    return targeted_features
+        .insert(feature_name.to_string(), properties)
+        .is_none();
 }
 
 fn get_polyfills(
     options: &PolyfillParameters,
     store: &str,
     version: &str,
-) -> HashMap<String, Feature> {
-    let ua: UA = if version == "3.25.1" {
-        // oldUA(options.ua_string)
-        unimplemented!("uh oh");
+) -> HashMap<String, FeatureProperties> {
+    let ua = if version == "3.25.1" {
+        U::Old(old_ua::OldUA::new(&options.ua_string))
     } else {
-        UA::new(&options.ua_string)
+        U::Current(UA::new(&options.ua_string))
     };
-    let unknown = ua.is_unknown();
-    let family = ua.get_family();
-    let mut feature_names: HashSet<String> =
-        HashSet::from_iter(options.features.keys().map(|f| f.to_owned()));
-    let mut targeted_features: HashMap<String, Feature> = HashMap::new();
+    let mut feature_names = options.features.keys().cloned().collect::<IndexSet<_>>();
+    feature_names.sort();
+    let mut targeted_features: HashMap<String, FeatureProperties> = HashMap::new();
+    // println!("feature_names: {:#?}", feature_names);
+    let mut seen_removed: HashSet<String> = Default::default();
     loop {
-        let mut bbreak = true;
+        let mut breakk = true;
         for feature_name in feature_names.clone() {
-            // Remove feature if it exists in the `excludes` array.
             if options.excludes.contains(&feature_name) {
-                let removed = remove_feature(
-                    feature_name.to_string(),
-                    &mut feature_names,
-                    &mut targeted_features,
-                );
-                if removed {
-                    bbreak = false;
+                if remove_feature(&feature_name, &mut feature_names, &mut targeted_features) {
+                    breakk = false;
+                    // println!("meow exclude - {}", feature_name);
                 }
                 continue;
             }
 
-            let feature = targeted_features.get(&feature_name);
-            let mut properties: Feature = match feature {
-                Some(f) => f.to_owned(),
-                None => Feature {
-                    comment: None,
-                    alias_of: HashSet::new(),
+            let feature = targeted_features
+                .get(&feature_name)
+                .cloned()
+                .unwrap_or_else(|| FeatureProperties {
                     flags: options
                         .features
                         .get(&feature_name)
-                        .map(|f| f.to_owned())
-                        .unwrap_or_else(HashSet::new),
-                },
+                        .cloned()
+                        .unwrap_or_default(),
+                    comment: Default::default(),
+                });
+
+            let mut properties = FeatureProperties {
+                flags: HashSet::new(),
+                comment: Default::default(),
             };
 
-            // If feature_name is an alias for a group of features
-            // Add each feature.
-            let alias = get_config_aliases(store, &feature_name);
-            if let Some(alias) = alias {
-                let mut alias_properties = Feature {
-                    comment: None,
-                    alias_of: properties.clone().alias_of,
-                    flags: properties.clone().flags,
-                };
-                alias_properties.alias_of.insert(feature_name.to_string());
-                for aliased_feature in alias {
-                    let added = add_feature(
+            // Handle alias logic here
+            let alias = match get_config_aliases(store, &feature_name) {
+                Some(alias) => alias,
+                None => Default::default(),
+            };
+
+            if !alias.is_empty() {
+                feature_names.remove(&feature_name);
+                for aliased_feature in alias.iter() {
+                    if add_feature(
                         aliased_feature,
-                        alias_properties.clone(),
+                        feature.flags.clone(),
+                        properties.clone(),
+                        // Some(format!("Alias of {feature_name}")),
                         &mut feature_names,
                         &mut targeted_features,
-                    );
-                    if added {
-                        bbreak = false;
+                    ) {
+                        breakk = false;
+                        // println!("meow alias {feature_name} - {aliased_feature}");
+                        // println!("feature.flags {:#?}", feature.flags);
                     }
                 }
                 continue;
             }
 
-            // If always flag is set, then the feature should be targeted at the browser.
-            let mut targeted = properties.flags.contains("always");
+            let mut targeted = feature.flags.contains("always");
 
-            // If not already targeted, then set targeted to true if the browser is unknown/unsupported
-            // and the unknown option is set the serve polyfills.
             if !targeted {
-                let unknown_override = options.unknown == "polyfill" && unknown;
+                let unknown_override = options.unknown == "polyfill" && ua.is_unknown();
                 if unknown_override {
                     targeted = true;
-                    properties.flags.insert("gated".to_owned());
+                    properties.flags.insert("gated".to_string());
                 }
             }
 
-            let meta = get_polyfill_meta(store, &feature_name);
-            if meta.is_none() {
-                // this is a bit strange but the best thing I could come up with.
-                // by adding the feature, it will show up as an "unrecognized" polyfill
-                // which I think is better than just pretending it doesn't exsist.
-                let added = add_feature(
-                    feature_name.to_string(),
-                    Default::default(),
-                    &mut feature_names,
-                    &mut targeted_features,
-                );
-                if added {
-                    bbreak = false;
+            let meta = match get_polyfill_meta(store, &feature_name) {
+                Some(meta) => meta,
+                None => {
+                    feature_names.remove(&feature_name);
+                    if add_feature(
+                        &feature_name,
+                        HashSet::new(),
+                        properties,
+                        // None,
+                        &mut feature_names,
+                        &mut targeted_features,
+                    ) {
+                        breakk = false;
+                        // println!("meow unknown - {}", feature_name);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let meta = meta.unwrap();
-            // If not already targeted, check to see if the polyfill's configuration states it should target
-            // this browser version.
+            };
+
             if !targeted {
-                targeted = ua.satisfies(meta.browsers.get(&family).unwrap().to_string());
+                if let Some(browsers) = meta.browsers {
+                    let is_browser_match = browsers
+                        .get(&ua.get_family())
+                        .map(|browser| ua.satisfies(browser.to_string()))
+                        .unwrap_or(false);
+
+                    targeted = is_browser_match;
+                }
             }
 
             if targeted {
-                let added = add_feature(
-                    feature_name.to_string(),
-                    properties.clone(),
-                    &mut feature_names,
-                    &mut targeted_features,
-                );
-                if added {
-                    bbreak = false;
-                }
-                let deps = meta.dependencies;
-                // If feature has dependency then add the dependencies as well.
-                if let Some(deps) = deps {
-                    let dependency_properties = Feature {
-                        comment: None,
-                        alias_of: properties.clone().alias_of,
-                        flags: properties.clone().flags.clone(),
-                    };
-                    for dep in deps {
-                        let added = add_feature(
-                            dep,
-                            dependency_properties.clone(),
-                            &mut feature_names,
-                            &mut targeted_features,
-                        );
-                        if added {
-                            bbreak = false;
+                if feature.flags.contains("always") || !seen_removed.contains(&feature_name) {
+                    seen_removed.insert(feature_name.to_string());
+                    feature_names.remove(&feature_name);
+                    if add_feature(
+                        &feature_name,
+                        feature.flags.clone(),
+                        properties.clone(),
+                        // None,
+                        &mut feature_names,
+                        &mut targeted_features,
+                    ) {
+                        breakk = false;
+                        // println!("meow targeted - {}", feature_name);
+                    }
+
+                    if let Some(deps) = meta.dependencies {
+                        for dep in deps.iter() {
+                            if add_feature(
+                                dep,
+                                feature.flags.clone(),
+                                properties.clone(),
+                                // Some(format!("Dependency of {feature_name}")),
+                                &mut feature_names,
+                                &mut targeted_features,
+                            ) {
+                                breakk = false;
+                                // println!("meow dep - {}", dep);
+                            }
                         }
                     }
                 }
             } else {
-                let removed = remove_feature(
-                    feature_name.to_string(),
-                    &mut feature_names,
-                    &mut targeted_features,
-                );
-                if removed {
-                    bbreak = false;
+                if targeted_features.contains_key(&feature_name) {
+                    let f = targeted_features.get(&feature_name).unwrap();
+                    if f.flags.contains("always") {
+                        continue;
+                    }
+                }
+                if remove_feature(&feature_name, &mut feature_names, &mut targeted_features) {
+                    breakk = false;
+                    // println!("meow remove - {}", feature_name);
                 }
             }
         }
-        if bbreak {
+
+        if breakk {
             break;
         }
     }
+    // println!("targeted_features {:#?}", targeted_features);
     targeted_features
 }
 
@@ -815,8 +899,11 @@ pub(crate) fn get_polyfill_string(
                     }
                 }
                 let license = polyfill.license.unwrap_or_else(|| "CC0".to_owned());
-                feature.comment = Some(format!("{feature_name}, License: {license}"));
-                // feature.comment = Some(format!("{feature_name}, License: {license}"));
+                feature.comment = feature
+                    .comment
+                    .clone()
+                    .map(|comment| format!("{feature_name}, License: {license} ({})", &comment))
+                    .or_else(|| Some(format!("{feature_name}, License: {license}")));
             }
             None => warnings.push(feature_name.to_string()),
         }
@@ -825,45 +912,29 @@ pub(crate) fn get_polyfill_string(
     feature_nodes.sort();
     feature_edges.sort_by_key(|f| f.1.to_string());
 
-    // feature_nodes.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-    // feature_edges.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
     let sorted_features = toposort(&feature_nodes, &feature_edges).unwrap();
     if !options.minify {
         explainer_comment.push(app_version_text);
         explainer_comment.push("For detailed credits and licence information see https://github.com/JakeChampion/polyfill-service.".to_owned());
         explainer_comment.push("".to_owned());
-        explainer_comment.push(
-            "Features requested: ".to_owned()
-                + &options
-                    .features
-                    .keys()
-                    .map(|s| s.to_owned())
-                    .collect::<Vec<String>>()
-                    .join(", "),
-        );
+        let mut features: Vec<String> = options.features.keys().map(|s| s.to_owned()).collect();
+        features.sort();
+        explainer_comment.push("Features requested: ".to_owned() + &features.join(","));
         explainer_comment.push("".to_owned());
         sorted_features.iter().for_each(|feature_name| {
             if let Some(feature) = targeted_features.get(feature_name) {
                 explainer_comment.push(format!("- {}", feature.comment.as_ref().unwrap()));
             }
         });
-        // explainer_comment.push(
-        //     sorted_features
-        //         .iter()
-        //         .map(|comment| "- ".to_string() + &comment)
-        //         .collect::<Vec<String>>()
-        //         .join("\n"),
-        // );
         if !warnings.is_empty() {
             explainer_comment.push("".to_owned());
             explainer_comment.push("These features were not recognised:".to_owned());
-            explainer_comment.push(
-                warnings
-                    .iter()
-                    .map(|s| "- ".to_owned() + s)
-                    .collect::<Vec<String>>()
-                    .join(", "),
-            );
+            let mut warnings = warnings
+                .iter()
+                .map(|s| "- ".to_owned() + s)
+                .collect::<Vec<String>>();
+            warnings.sort();
+            explainer_comment.push(warnings.join(","));
         }
     } else {
         explainer_comment.push(app_version_text);
@@ -889,18 +960,27 @@ pub(crate) fn get_polyfill_string(
                             output.write_str(detect_source.as_str());
                             output.write_str(")) {");
                             output.write_str(lf);
-                            output.append(polyfill_source(store, &feature_name, m));
+                            let bb = polyfill_source(store, &feature_name, m);
+                            output.append(bb);
                             output.write_str(lf);
                             output.write_str("}");
                             output.write_str(lf);
                             output.write_str(lf);
+                        } else {
+                            let bb = polyfill_source(store, &feature_name, m);
+                            output.append(bb);
                         }
+                    } else {
+                        let bb = polyfill_source(store, &feature_name, m);
+                        output.append(bb);
                     }
                 } else {
-                    output.append(polyfill_source(store, &feature_name, m));
+                    let bb = polyfill_source(store, &feature_name, m);
+                    output.append(bb);
                 }
             } else {
-                output.append(polyfill_source(store, &feature_name, m));
+                let bb = polyfill_source(store, &feature_name, m);
+                output.append(bb);
             }
         }
         // Invoke the closure, passing the global object as the only argument
@@ -921,29 +1001,41 @@ pub(crate) fn get_polyfill_string(
     output
 }
 
-static POLYFILL_SOURCE_CONFIG_STORE: OnceLock<ConfigStore> = OnceLock::new();
+// static POLYFILL_SOURCE_CONFIG_STORE: OnceLock<ConfigStore> = OnceLock::new();
 static POLYFILL_SOURCE_KV_STORE: OnceLock<KVStore> = OnceLock::new();
 fn polyfill_source(store: &str, feature_name: &str, format: &str) -> Body {
-    let c = POLYFILL_SOURCE_CONFIG_STORE.get_or_init(|| {
-        let n = store.replace(['-', '.'], "_");
-        ConfigStore::open(&n)
-    });
-    let c = c.get(&format!("{feature_name}/{format}.js"));
-    if let Some(c) = c {
-        return Body::from(c);
-    }
+    // let c = POLYFILL_SOURCE_CONFIG_STORE.get_or_init(|| {
+    //     let n = store.replace(['-', '.'], "_");
+    //     ConfigStore::open(&n)
+    // });
+    // let c = c.get(&format!("{feature_name}/{format}.js"));
+    // if let Some(c) = c {
+    //     let bb = Body::from(c);
+    //     return bb;
+    // } else {
     let polyfills =
         POLYFILL_SOURCE_KV_STORE.get_or_init(|| KVStore::open(&store).unwrap().unwrap());
-    // return Body::from("value");
-    let polyfill = polyfills
-        .lookup(&format!("/{feature_name}/{format}.js"))
-        .unwrap();
-    if polyfill.is_none() {
-        let format = if format == "raw" { "min" } else { "raw" };
-        let polyfill = polyfills
-            .lookup(&format!("/{feature_name}/{format}.js"))
-            .unwrap();
-        return polyfill.unwrap();
+    let polyfill = polyfills.lookup(&format!("/{feature_name}/{format}.js"));
+    match polyfill {
+        Ok(Some(polyfill)) => polyfill,
+        Ok(None) => {
+            let format = if format == "raw" { "min" } else { "raw" };
+            let polyfill = polyfills
+                .lookup(&format!("/{feature_name}/{format}.js"))
+                .unwrap();
+            let bb = polyfill.unwrap();
+            return bb;
+        }
+        Err(e) => {
+            panic!(
+                "utc: {} host: {} store: {} key: {} error: {}",
+                Utc::now(),
+                std::env::var("FASTLY_HOSTNAME").unwrap_or_else(|_| String::new()),
+                store,
+                &format!("/{feature_name}/{format}.js"),
+                e.to_string()
+            )
+        }
     }
-    polyfill.unwrap()
+    // }
 }

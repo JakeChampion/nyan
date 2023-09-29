@@ -11,8 +11,17 @@ publish = false
 debug = 1
 
 [dependencies]
+base16ct = { version = "0.2.0", features = ["alloc"] }
+chrono = "0.4.31"
 fastly = "0.9.7"
+http = "0.2.9"
+http-range = "0.1.5"
+httpdate = "1.0.3"
+indexmap = "2.0.0"
+nodejs-semver = "3.0.0"
 regex = "1.9.5"
 semver = "1.0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.105"
+sha2 = "0.10.8"
+urlencoding = "2.1.3"
